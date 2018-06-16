@@ -1,0 +1,138 @@
+
+- name: Update cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install tor
+  apt:
+    name: tor
+
+- name: Install dnsmasq
+  apt:
+    name: dnsmasq
+
+- debug:
+    msg: "Tor interface name: {{tor_interface}}"
+
+- debug:
+    msg: "Your pubkey: {{pubkey_string.stdout}}"
+
+- name: Set mitm users authorized key file
+  authorized_key:
+    user: "{{ansible_user_id}}"
+    key: "{{pubkey_string.stdout}}"
+
+- name: Activate pubkey auth
+  lineinfile:
+    line: "PubkeyAuthentication yes"
+    path: /etc/ssh/sshd_config
+
+- name: Deactivate ssh password auth
+  lineinfile:
+    line: "PasswordAuthentication no"
+    path: /etc/ssh/sshd_config
+  when: ssh_pwd_auth == "yes"
+
+- name: Setting static ip
+  blockinfile:
+    path: /etc/network/interfaces
+    block: |
+      auto {{tor_interface}}
+      iface {{tor_interface}} inet static
+        address {{own_ip}}
+        netmask 255.255.255.0
+
+- name: Delete dnsmasq.conf
+  file:
+    path: /etc/dnsmasq.conf
+    state: absent
+
+- name: Setting up dhcp-server
+  blockinfile:
+    path: /etc/dnsmasq.conf
+    create: yes
+    block: |
+      interface={{tor_interface}}
+      dhcp-range={{start_ip_range}},{{end_ip_range}},96h
+      dhcp-option=option:router,{{own_ip}}
+      dhcp-option=option:dns-server,{{own_ip}}
+
+- name: Starting dhcp-server
+  systemd:
+    enabled: yes
+    name: dnsmasq
+    state: restarted
+
+- name: Restart network service for interface "{{tor_interface}}"
+  systemd:
+    daemon_reload: yes
+    name: networking
+    state: restarted
+
+# TODO Check if there is a way to send a packet that evades the redirection to the tor proxy port
+- name: Masquerade packets from tor interface
+  iptables:
+    table: nat
+    action: insert
+    chain: POSTROUTING
+    source: "{{ip_netmask}}"
+    jump: MASQUERADE
+
+
+- name: Reroute dns packets
+  iptables:
+    table: nat
+    action: append
+    chain: PREROUTING
+    in_interface: "{{tor_interface}}"
+    protocol: udp
+    destination_port: 53
+    jump: REDIRECT
+    to_ports: 53
+
+- name: Reroute tcp packets
+  iptables:
+    table: nat
+    action: append
+    chain: PREROUTING
+    in_interface: "{{tor_interface}}"
+    protocol: tcp
+    jump: REDIRECT
+    to_ports: "{{tor_port}}"
+
+- name: Make iptables-persistent
+  apt:
+    name: iptables-persistent
+
+- name: Delete default config
+  file:
+    path: /etc/tor/torrc
+    state: absent
+
+- name: Configure tor
+  blockinfile:
+    path: /etc/tor/torrc
+    block: |
+      VirtualAddrNetwork 10.192.0.0/10
+      AutomapHostsOnResolve 1
+      TransPort {{tor_port}}
+      TransListenAddress {{own_ip}}
+      DNSPort 53
+      DNSListenAddress {{own_ip}}
+    create: yes
+
+- name: Restart tor service
+  systemd:
+    daemon_reload: yes
+    name: tor
+    state: restarted
+
+# create a 'Share' directory
+- name: Create 'Share' directory
+  file:
+    path: /home/"{{ansible_user_id}}"/Share
+    state: directory
+    mode: 0755
+
+
